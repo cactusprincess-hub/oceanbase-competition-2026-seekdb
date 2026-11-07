@@ -20,6 +20,7 @@
 #include "observer/ob_server_runtime_access.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "observer/mysql/obmp_query.h"
+#include "observer/mysql/ob_file_sql_rewriter.h"
 #include "sql/engine/ob_physical_plan.h"
 
 #include "observer/mysql/ob_sync_plan_driver.h"
@@ -65,6 +66,9 @@ int ObMPQuery::process()
   bool need_disconnect = true;
   bool async_resp_used = false; // Asynchronously reply to the client by the transaction commit thread
   int64_t query_timeout = 0;
+  ObSqlString file_sql;
+  ObString effective_sql;
+  bool file_sql_rewritten = false;
   ObCurTraceId::TraceId *cur_trace_id = ObCurTraceId::get_trace_id();
   ObSMConnection *conn = get_conn();
   bool do_ins_batch_opt = false;
@@ -104,7 +108,10 @@ int ObMPQuery::process()
         need_disconnect = false;
         ret = OB_ERR_NET_PACKET_TOO_LARGE;
       } else if (OB_FAIL(session.gen_configs_in_pc_str())) {
+      } else if (OB_FAIL(ObFileSqlRewriter::rewrite(sql_, session, file_sql, file_sql_rewritten))) {
+        need_disconnect = false;
       } else {
+        effective_sql = file_sql_rewritten ? file_sql.string() : sql_;
         THIS_WORKER.set_timeout_ts(get_receive_timestamp() + query_timeout);
         retry_ctrl_.set_current_global_schema_version(database_schema_version);
         session.set_pl_can_retry(true);
@@ -121,7 +128,7 @@ int ObMPQuery::process()
         ObMPParseStat parse_stat;
         if (config::enable_record_trace_id()) {
           PreParseResult pre_parse_result;
-          if (OB_FAIL(ObParser::pre_parse(sql_, pre_parse_result))) {
+          if (OB_FAIL(ObParser::pre_parse(effective_sql, pre_parse_result))) {
           } else {
             session.set_app_trace_id(pre_parse_result.trace_id_);
             LOG_DEBUG("app trace id", "app_trace_id", pre_parse_result.trace_id_,
@@ -131,7 +138,7 @@ int ObMPQuery::process()
 
         if (OB_FAIL(ret)) {
           //do nothing
-        } else if (OB_FAIL(parser.split_multiple_stmt(sql_, queries, parse_stat))) {
+        } else if (OB_FAIL(parser.split_multiple_stmt(effective_sql, queries, parse_stat))) {
           // Enter this branch, indicating that push_back failed due to OOM, delegate the outer code to return an error code
           // and after entering this branch, the connection should be terminated
           need_response_error = true;
@@ -230,7 +237,7 @@ int ObMPQuery::process()
           } else {
             EVENT_INC(SQL_SINGLE_QUERY_COUNT);
             // Handle ordinary Single Statement
-            ret = process_single_stmt(ObMultiStmtItem(false, 0, sql_),
+            ret = process_single_stmt(ObMultiStmtItem(false, 0, effective_sql),
                                       conn,
                                       session,
                                       has_more,

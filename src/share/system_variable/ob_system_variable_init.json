@@ -2459,6 +2459,19 @@
     "background_cn": "导入导出功能未限制文件访问可能存在漏洞",
     "ref_url": ""
   },
+  "enable_file_sql": {
+    "id": 19999,
+    "name": "enable_file_sql",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "Enable querying local CSV and JSONL files as SQL relations.",
+    "flags": "SESSION | INFLUENCE_PLAN",
+    "publish_version": "",
+    "info_cn": "允许将本地 CSV 和 JSONL 文件作为 SQL 关系查询",
+    "background_cn": "文件 SQL 默认关闭，并受 secure_file_priv 限制",
+    "ref_url": ""
+  },
   "_enable_parallel_query": {
     "id": 10104,
     "name": "_enable_parallel_query",
