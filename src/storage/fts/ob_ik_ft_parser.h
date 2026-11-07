@@ -34,16 +34,16 @@ class ObFTDictHub;
 class ObIKFTParser final : public ObITokenIterator
 {
 public:
-  ObIKFTParser(ObIAllocator &allocator, ObFTDictHub *hub)
-      : allocator_(allocator),
+  ObIKFTParser(ObIAllocator &metadata_allocator, ObFTDictHub *hub)
+      : metadata_allocator_(metadata_allocator),
         is_inited_(false),
         coll_type_(ObCollationType::CS_TYPE_INVALID),
         ctx_(nullptr),
         hub_(hub),
-        segmenters_(allocator_),
-        cache_main_(allocator),
-        cache_quan_(allocator),
-        cache_stop_(allocator),
+        segmenters_(metadata_allocator_),
+        cache_main_(metadata_allocator),
+        cache_quan_(metadata_allocator),
+        cache_stop_(metadata_allocator),
         dict_main_(nullptr),
         dict_quan_(nullptr),
         dict_stop_(nullptr)
@@ -58,6 +58,7 @@ public:
                      int64_t &word_len,
                      int64_t &char_cnt,
                      int64_t &word_freq) override;
+  int reuse(const ObFTParserParam &param) override;
 
   VIRTUAL_TO_STRING_KV(K(is_inited_));
 
@@ -90,7 +91,7 @@ private:
 
 private:
   static constexpr int SEGMENT_LIMIT = 1000;
-  ObIAllocator &allocator_;
+  ObIAllocator &metadata_allocator_;
   bool is_inited_;
 
   ObCollationType coll_type_;

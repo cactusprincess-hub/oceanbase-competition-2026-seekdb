@@ -49,7 +49,7 @@ int ObBEngFTParser::get_next_token(
     }
   } else if (OB_ISNULL(token.ptr_) || OB_UNLIKELY(0 >= token.len_ || 0 >= token_freq)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_ISNULL(buf = static_cast<char *>(allocator_.alloc(token.len_)))) {
+  } else if (OB_ISNULL(buf = static_cast<char *>(scratch_allocator_.alloc(token.len_)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
     MEMCPY(buf, token.ptr_, token.len_);
@@ -58,6 +58,26 @@ int ObBEngFTParser::get_next_token(
     char_len = token.len_;
     word_freq = token_freq;
     LOG_DEBUG("succeed to add word", K(ObString(word_len, word)), K(word_freq));
+  }
+  return ret;
+}
+
+int ObBEngFTParser::reuse(const ObFTParserParam &param)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_ISNULL(param.cs_) || param.cs_ != analysis_ctx_.cs_
+      || OB_ISNULL(param.fulltext_) || OB_UNLIKELY(param.ft_length_ <= 0)
+      || OB_UNLIKELY(UINT32_MAX < param.ft_length_)
+      || OB_ISNULL(param.allocator_) || param.allocator_ != &scratch_allocator_) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    doc_.set_string(param.fulltext_, param.ft_length_);
+    if (OB_FAIL(segment(doc_, token_stream_))) {
+    } else if (OB_ISNULL(token_stream_)) {
+      ret = OB_ERR_UNEXPECTED;
+    }
   }
   return ret;
 }
@@ -76,7 +96,7 @@ int ObBEngFTParser::init(ObFTParserParam *param)
     analysis_ctx_.cs_ = param->cs_;
     analysis_ctx_.filter_stopword_ = false;
     analysis_ctx_.need_grouping_ = false;
-    if (OB_FAIL(english_analyzer_.init(analysis_ctx_, *param->allocator_))) {
+    if (OB_FAIL(english_analyzer_.init(analysis_ctx_, metadata_allocator_))) {
     } else if (OB_FAIL(segment(doc_, token_stream_))) {
     } else if (OB_ISNULL(token_stream_)) {
       ret = OB_ERR_UNEXPECTED;
@@ -123,15 +143,28 @@ int ObBasicEnglishFTParserDesc::segment(
   ObBEngFTParser *parser = nullptr;
   if (OB_ISNULL(param) || OB_ISNULL(param->fulltext_) || OB_UNLIKELY(!param->is_valid())) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_ISNULL(parser = OB_NEWx(ObBEngFTParser, param->allocator_, *(param->allocator_)))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(parser->init(param))) {
   } else {
-    iter = parser;
+    ObIAllocator *metadata_allocator = OB_NOT_NULL(param->metadata_allocator_)
+        ? param->metadata_allocator_
+        : param->allocator_;
+    if (OB_ISNULL(parser = OB_NEWx(ObBEngFTParser,
+                                   metadata_allocator,
+                                   *metadata_allocator,
+                                   *(param->allocator_)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(parser->init(param))) {
+    } else {
+      iter = parser;
+    }
   }
 
   if (OB_FAIL(ret)) {
-    OB_DELETEx(ObBEngFTParser, param->allocator_, parser);
+    ObIAllocator *metadata_allocator = OB_NOT_NULL(param) && OB_NOT_NULL(param->metadata_allocator_)
+        ? param->metadata_allocator_
+        : (OB_NOT_NULL(param) ? param->allocator_ : nullptr);
+    if (OB_NOT_NULL(metadata_allocator)) {
+      OB_DELETEx(ObBEngFTParser, metadata_allocator, parser);
+    }
   }
 
   return ret;
@@ -143,9 +176,12 @@ void ObBasicEnglishFTParserDesc::free_token_iter(
 {
   if (OB_NOT_NULL(iter)) {
     abort_unless(nullptr != param);
-    abort_unless(nullptr != param->allocator_);
+    ObIAllocator *metadata_allocator = OB_NOT_NULL(param->metadata_allocator_)
+        ? param->metadata_allocator_
+        : param->allocator_;
+    abort_unless(nullptr != metadata_allocator);
     iter->~ObITokenIterator();
-    param->allocator_->free(iter);
+    metadata_allocator->free(iter);
   }
 }
 

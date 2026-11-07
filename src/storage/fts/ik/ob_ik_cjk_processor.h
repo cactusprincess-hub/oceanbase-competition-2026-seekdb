@@ -40,6 +40,12 @@ public:
                  const char *ch,
                  const uint8_t char_len,
                  const ObFTCharUtil::CharType type) override;
+  void reuse() override
+  {
+    hits_.reset();
+    cjk_start_ = -1;
+    cjk_end_ = -1;
+  }
 
 private:
   ObList<ObDATrieHit, ObIAllocator> hits_;

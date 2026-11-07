@@ -207,7 +207,7 @@ public:
   TO_STRING_KV(KP_(allocator), K_(parser_name), KP_(parser_desc), K_(is_inited));
 
 private:
-  static int segment(
+  int segment(
       const ObFTParserProperty &property,
       const int64_t parser_version,
       const ObIFTParserDesc *parser_desc,
@@ -215,7 +215,8 @@ private:
       const char *fulltext,
       const int64_t fulltext_len,
       common::ObIAllocator &allocator,
-      ObAddWord &add_word);
+      ObAddWord &add_word) const;
+  void free_cached_token_iterator() const;
   int set_add_word_flag(const ObIFTParserDesc &ftparser_desc);
 private:
   common::ObIAllocator *allocator_;
@@ -223,6 +224,8 @@ private:
   ObFTParser parser_name_;
   ObAddWordFlag add_word_flag_;
   ObFTParserProperty parser_property_;
+  mutable common::ObFIFOAllocator metadata_allocator_;
+  mutable ObITokenIterator *token_iterator_;
   bool is_inited_;
 
 private:

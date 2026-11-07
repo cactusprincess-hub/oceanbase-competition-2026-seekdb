@@ -63,6 +63,7 @@ public:
         ft_length_(0),
         parser_version_(0),
         allocator_(nullptr),
+        metadata_allocator_(nullptr),
         ik_param_(),
         ngram_token_size_(NGRAM_TOKEN_SIZE),
         min_ngram_size_(NGRAM_TOKEN_SIZE),
@@ -87,6 +88,7 @@ public:
     ft_length_ = 0;
     parser_version_ = 0;
     allocator_ = nullptr;
+    metadata_allocator_ = nullptr;
     ik_param_ = ObFTIKParam();
     ngram_token_size_ = NGRAM_TOKEN_SIZE;
     min_ngram_size_ = NGRAM_TOKEN_SIZE;
@@ -98,6 +100,7 @@ public:
                K_(ft_length),
                K_(parser_version),
                KP_(allocator),
+               KP_(metadata_allocator),
                K_(ngram_token_size),
                K_(min_ngram_size),
                K_(max_ngram_size));
@@ -108,6 +111,7 @@ public:
   int64_t ft_length_;
   int64_t parser_version_;
   common::ObIAllocator *allocator_;
+  common::ObIAllocator *metadata_allocator_;
   ObFTIKParam ik_param_;
   int64_t ngram_token_size_;
   int64_t min_ngram_size_;
@@ -124,6 +128,11 @@ public:
       int64_t &word_len,
       int64_t &char_cnt,
       int64_t &word_freq) = 0;
+  virtual int reuse(const ObFTParserParam &param)
+  {
+    (void)param;
+    return OB_NOT_SUPPORTED;
+  }
   DECLARE_PURE_VIRTUAL_TO_STRING;
 };
 
