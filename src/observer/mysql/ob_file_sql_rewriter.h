@@ -21,11 +21,15 @@
 #include <cctype>
 #include <cerrno>
 #include <climits>
+#include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <glob.h>
+#include <iomanip>
+#include <limits>
 #include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -55,6 +59,13 @@ public:
     int ret = OB_SUCCESS;
     rewritten = false;
     const std::string input_sql(input.ptr(), static_cast<size_t>(input.length()));
+    bool describe_rewritten = false;
+    if (OB_FAIL(rewrite_describe(input_sql, session, output, describe_rewritten))) {
+      return ret;
+    } else if (describe_rewritten) {
+      rewritten = true;
+      return ret;
+    }
     std::string copy_sql;
     bool copy_rewritten = false;
     if (OB_FAIL(rewrite_copy(input_sql, session, copy_sql, copy_rewritten))) {
@@ -95,7 +106,7 @@ public:
   }
 
 private:
-  enum class Kind { CSV, JSONL, GLOB };
+  enum class Kind { CSV, JSONL, PARQUET, GLOB };
   enum class ValueType { NULL_VALUE, BOOL, INT, DOUBLE, DATE, DATETIME, STRING };
 
   struct Match
@@ -120,6 +131,205 @@ private:
   {
     std::vector<std::string> columns_;
     std::vector<std::vector<Cell> > rows_;
+  };
+
+  struct CompactField
+  {
+    CompactField() : id_(0), type_(0), bool_value_(false) {}
+    int16_t id_;
+    uint8_t type_;
+    bool bool_value_;
+  };
+
+  class CompactReader
+  {
+  public:
+    CompactReader(const std::string &data, const size_t begin, const size_t end)
+        : data_(data), pos_(begin), end_(std::min(end, data.size())), valid_(begin <= end_) {}
+
+    bool valid() const { return valid_; }
+    size_t position() const { return pos_; }
+
+    bool read_field(int16_t &previous_id, CompactField &field)
+    {
+      uint8_t header = 0;
+      if (!read_byte(header)) {
+        return false;
+      }
+      field.type_ = header & 0x0F;
+      field.bool_value_ = 1 == field.type_;
+      if (0 == field.type_) {
+        return true;
+      }
+      const uint8_t delta = header >> 4;
+      int64_t id = 0;
+      if (0 != delta) {
+        id = previous_id + delta;
+      } else if (!read_zigzag(id)) {
+        return false;
+      }
+      if (id < 0 || id > INT16_MAX) {
+        valid_ = false;
+        return false;
+      }
+      field.id_ = static_cast<int16_t>(id);
+      previous_id = field.id_;
+      return true;
+    }
+
+    bool read_integer(int64_t &value) { return read_zigzag(value); }
+
+    bool read_binary(std::string &value)
+    {
+      uint64_t size = 0;
+      if (!read_varint(size) || size > end_ - pos_) {
+        valid_ = false;
+        return false;
+      }
+      value.assign(data_, pos_, static_cast<size_t>(size));
+      pos_ += static_cast<size_t>(size);
+      return true;
+    }
+
+    bool read_collection(uint8_t &element_type, uint64_t &size)
+    {
+      uint8_t header = 0;
+      if (!read_byte(header)) {
+        return false;
+      }
+      element_type = header & 0x0F;
+      size = header >> 4;
+      return 15 != size || read_varint(size);
+    }
+
+    bool skip(const uint8_t type)
+    {
+      bool success = valid_;
+      if (!success || 0 == type || 1 == type || 2 == type) {
+      } else if (3 == type) {
+        uint8_t ignored = 0;
+        success = read_byte(ignored);
+      } else if (4 == type || 5 == type || 6 == type) {
+        uint64_t ignored = 0;
+        success = read_varint(ignored);
+      } else if (7 == type) {
+        success = skip_bytes(8);
+      } else if (8 == type) {
+        std::string ignored;
+        success = read_binary(ignored);
+      } else if (9 == type || 10 == type) {
+        uint8_t element_type = 0;
+        uint64_t size = 0;
+        success = read_collection(element_type, size);
+        for (uint64_t i = 0; success && i < size; ++i) {
+          success = skip(element_type);
+        }
+      } else if (11 == type) {
+        uint64_t size = 0;
+        success = read_varint(size);
+        uint8_t key_value_types = 0;
+        if (success && size > 0) {
+          success = read_byte(key_value_types);
+        }
+        for (uint64_t i = 0; success && i < size; ++i) {
+          success = skip(key_value_types >> 4) && skip(key_value_types & 0x0F);
+        }
+      } else if (12 == type) {
+        int16_t previous_id = 0;
+        CompactField field;
+        while (success && read_field(previous_id, field) && 0 != field.type_) {
+          success = skip(field.type_);
+        }
+      } else {
+        valid_ = false;
+        success = false;
+      }
+      return success;
+    }
+
+  private:
+    bool read_byte(uint8_t &value)
+    {
+      if (pos_ >= end_) {
+        valid_ = false;
+        return false;
+      }
+      value = static_cast<uint8_t>(data_[pos_++]);
+      return true;
+    }
+
+    bool read_varint(uint64_t &value)
+    {
+      value = 0;
+      for (int shift = 0; shift < 64; shift += 7) {
+        uint8_t byte = 0;
+        if (!read_byte(byte)) {
+          return false;
+        }
+        value |= static_cast<uint64_t>(byte & 0x7F) << shift;
+        if (0 == (byte & 0x80)) {
+          return true;
+        }
+      }
+      valid_ = false;
+      return false;
+    }
+
+    bool read_zigzag(int64_t &value)
+    {
+      uint64_t encoded = 0;
+      if (!read_varint(encoded)) {
+        return false;
+      }
+      value = static_cast<int64_t>(encoded >> 1) ^ -static_cast<int64_t>(encoded & 1);
+      return true;
+    }
+
+    bool skip_bytes(const size_t size)
+    {
+      if (size > end_ - pos_) {
+        valid_ = false;
+        return false;
+      }
+      pos_ += size;
+      return true;
+    }
+
+    const std::string &data_;
+    size_t pos_;
+    size_t end_;
+    bool valid_;
+  };
+
+  struct ParquetSchema
+  {
+    ParquetSchema()
+        : type_(-1), type_length_(0), repetition_(0), converted_type_(-1), name_() {}
+    int32_t type_;
+    int32_t type_length_;
+    int32_t repetition_;
+    int32_t converted_type_;
+    std::string name_;
+  };
+
+  struct ParquetChunk
+  {
+    ParquetChunk()
+        : type_(-1), codec_(0), num_values_(0), data_page_offset_(0),
+          dictionary_page_offset_(-1), path_() {}
+    int32_t type_;
+    int32_t codec_;
+    int64_t num_values_;
+    int64_t data_page_offset_;
+    int64_t dictionary_page_offset_;
+    std::string path_;
+  };
+
+  struct ParquetRowGroup
+  {
+    ParquetRowGroup() : num_rows_(0), chunks_() {}
+    int64_t num_rows_;
+    std::vector<ParquetChunk> chunks_;
   };
 
   static bool is_ident_char(const char c)
@@ -256,6 +466,7 @@ private:
         ++i;
       } else if (locate_call(sql, i, "read_csv", Kind::CSV, match)
               || locate_call(sql, i, "read_json", Kind::JSONL, match)
+              || locate_call(sql, i, "read_parquet", Kind::PARQUET, match)
               || locate_call(sql, i, "glob", Kind::GLOB, match)) {
         return true;
       }
@@ -294,6 +505,33 @@ private:
     }
     result.push_back(trim(args.substr(begin)));
     return result;
+  }
+
+  static int rewrite_describe(const std::string &sql,
+                              sql::ObSQLSessionInfo &session,
+                              common::ObSqlString &output,
+                              bool &rewritten)
+  {
+    int ret = OB_SUCCESS;
+    rewritten = false;
+    Match match;
+    if (find_next(sql, 0, match) && Kind::GLOB != match.kind_) {
+      const std::string prefix = lower(trim(sql.substr(0, match.begin_)));
+      std::string suffix = trim(sql.substr(match.end_));
+      if (!suffix.empty() && ';' == suffix[suffix.size() - 1]) {
+        suffix = trim(suffix.substr(0, suffix.size() - 1));
+      }
+      if ("describe select * from" == prefix && suffix.empty()) {
+        std::string schema_sql;
+        if (OB_FAIL(build_relation(sql.substr(match.args_begin_, match.args_end_ - match.args_begin_),
+                                   match.kind_, session, schema_sql, true))) {
+        } else if (OB_FAIL(output.assign(schema_sql.data(), static_cast<int64_t>(schema_sql.size())))) {
+        } else {
+          rewritten = true;
+        }
+      }
+    }
+    return ret;
   }
 
   static std::string compact_option(const std::string &option)
@@ -665,6 +903,652 @@ private:
     return ret;
   }
 
+  static uint32_t read_u32_le(const char *data)
+  {
+    return static_cast<uint32_t>(static_cast<unsigned char>(data[0]))
+        | (static_cast<uint32_t>(static_cast<unsigned char>(data[1])) << 8)
+        | (static_cast<uint32_t>(static_cast<unsigned char>(data[2])) << 16)
+        | (static_cast<uint32_t>(static_cast<unsigned char>(data[3])) << 24);
+  }
+
+  static uint64_t read_u64_le(const char *data)
+  {
+    return static_cast<uint64_t>(read_u32_le(data))
+        | (static_cast<uint64_t>(read_u32_le(data + 4)) << 32);
+  }
+
+  static bool compact_integer(CompactReader &reader, int32_t &value)
+  {
+    int64_t decoded = 0;
+    const bool success = reader.read_integer(decoded)
+        && decoded >= INT32_MIN && decoded <= INT32_MAX;
+    if (success) {
+      value = static_cast<int32_t>(decoded);
+    }
+    return success;
+  }
+
+  static bool parse_parquet_schema_element(CompactReader &reader, ParquetSchema &schema)
+  {
+    int16_t previous_id = 0;
+    CompactField field;
+    bool success = true;
+    while (success && reader.read_field(previous_id, field) && 0 != field.type_) {
+      if (1 == field.id_ && 5 == field.type_) {
+        success = compact_integer(reader, schema.type_);
+      } else if (2 == field.id_ && 5 == field.type_) {
+        success = compact_integer(reader, schema.type_length_);
+      } else if (3 == field.id_ && 5 == field.type_) {
+        success = compact_integer(reader, schema.repetition_);
+      } else if (4 == field.id_ && 8 == field.type_) {
+        success = reader.read_binary(schema.name_);
+      } else if (6 == field.id_ && 5 == field.type_) {
+        success = compact_integer(reader, schema.converted_type_);
+      } else {
+        success = reader.skip(field.type_);
+      }
+    }
+    return success && reader.valid() && !schema.name_.empty();
+  }
+
+  static bool parse_parquet_column_metadata(CompactReader &reader, ParquetChunk &chunk)
+  {
+    int16_t previous_id = 0;
+    CompactField field;
+    bool success = true;
+    while (success && reader.read_field(previous_id, field) && 0 != field.type_) {
+      if (1 == field.id_ && 5 == field.type_) {
+        success = compact_integer(reader, chunk.type_);
+      } else if (3 == field.id_ && 9 == field.type_) {
+        uint8_t element_type = 0;
+        uint64_t size = 0;
+        success = reader.read_collection(element_type, size) && 8 == element_type;
+        for (uint64_t i = 0; success && i < size; ++i) {
+          success = reader.read_binary(chunk.path_);
+        }
+      } else if (4 == field.id_ && 5 == field.type_) {
+        success = compact_integer(reader, chunk.codec_);
+      } else if (5 == field.id_ && 6 == field.type_) {
+        success = reader.read_integer(chunk.num_values_);
+      } else if (9 == field.id_ && 6 == field.type_) {
+        success = reader.read_integer(chunk.data_page_offset_);
+      } else if (11 == field.id_ && 6 == field.type_) {
+        success = reader.read_integer(chunk.dictionary_page_offset_);
+      } else {
+        success = reader.skip(field.type_);
+      }
+    }
+    return success && reader.valid() && chunk.type_ >= 0 && chunk.num_values_ >= 0
+        && chunk.data_page_offset_ >= 4 && !chunk.path_.empty();
+  }
+
+  static bool parse_parquet_column_chunk(CompactReader &reader, ParquetChunk &chunk)
+  {
+    int16_t previous_id = 0;
+    CompactField field;
+    bool success = true;
+    bool found_metadata = false;
+    while (success && reader.read_field(previous_id, field) && 0 != field.type_) {
+      if (3 == field.id_ && 12 == field.type_) {
+        success = parse_parquet_column_metadata(reader, chunk);
+        found_metadata = success;
+      } else {
+        success = reader.skip(field.type_);
+      }
+    }
+    return success && found_metadata;
+  }
+
+  static bool parse_parquet_row_group(CompactReader &reader, ParquetRowGroup &row_group)
+  {
+    int16_t previous_id = 0;
+    CompactField field;
+    bool success = true;
+    while (success && reader.read_field(previous_id, field) && 0 != field.type_) {
+      if (1 == field.id_ && 9 == field.type_) {
+        uint8_t element_type = 0;
+        uint64_t size = 0;
+        success = reader.read_collection(element_type, size) && 12 == element_type && size <= 1024;
+        for (uint64_t i = 0; success && i < size; ++i) {
+          ParquetChunk chunk;
+          success = parse_parquet_column_chunk(reader, chunk);
+          if (success) {
+            row_group.chunks_.push_back(chunk);
+          }
+        }
+      } else if (3 == field.id_ && 6 == field.type_) {
+        success = reader.read_integer(row_group.num_rows_);
+      } else {
+        success = reader.skip(field.type_);
+      }
+    }
+    return success && reader.valid() && row_group.num_rows_ >= 0
+        && row_group.num_rows_ <= 1000000 && !row_group.chunks_.empty();
+  }
+
+  static bool parse_parquet_footer(const std::string &content,
+                                   const size_t footer_begin,
+                                   std::vector<ParquetSchema> &schemas,
+                                   std::vector<ParquetRowGroup> &row_groups)
+  {
+    CompactReader reader(content, footer_begin, content.size() - 8);
+    int16_t previous_id = 0;
+    CompactField field;
+    bool success = true;
+    int64_t declared_rows = -1;
+    while (success && reader.read_field(previous_id, field) && 0 != field.type_) {
+      if (2 == field.id_ && 9 == field.type_) {
+        uint8_t element_type = 0;
+        uint64_t size = 0;
+        success = reader.read_collection(element_type, size) && 12 == element_type
+            && size > 1 && size <= 1025;
+        for (uint64_t i = 0; success && i < size; ++i) {
+          ParquetSchema schema;
+          success = parse_parquet_schema_element(reader, schema);
+          if (success) {
+            schemas.push_back(schema);
+          }
+        }
+      } else if (3 == field.id_ && 6 == field.type_) {
+        success = reader.read_integer(declared_rows);
+      } else if (4 == field.id_ && 9 == field.type_) {
+        uint8_t element_type = 0;
+        uint64_t size = 0;
+        success = reader.read_collection(element_type, size) && 12 == element_type && size <= 10000;
+        for (uint64_t i = 0; success && i < size; ++i) {
+          ParquetRowGroup row_group;
+          success = parse_parquet_row_group(reader, row_group);
+          if (success) {
+            row_groups.push_back(row_group);
+          }
+        }
+      } else {
+        success = reader.skip(field.type_);
+      }
+    }
+    int64_t actual_rows = 0;
+    for (const ParquetRowGroup &row_group : row_groups) {
+      actual_rows += row_group.num_rows_;
+    }
+    return success && reader.valid() && schemas.size() > 1 && !row_groups.empty()
+        && declared_rows == actual_rows;
+  }
+
+  struct ParquetPage
+  {
+    ParquetPage()
+        : type_(-1), uncompressed_size_(0), compressed_size_(0), num_values_(0),
+          encoding_(-1), definition_length_(0), repetition_length_(0),
+          values_compressed_(true), header_end_(0) {}
+    int32_t type_;
+    int32_t uncompressed_size_;
+    int32_t compressed_size_;
+    int32_t num_values_;
+    int32_t encoding_;
+    int32_t definition_length_;
+    int32_t repetition_length_;
+    bool values_compressed_;
+    size_t header_end_;
+  };
+
+  static bool parse_parquet_data_page_header(CompactReader &reader, ParquetPage &page)
+  {
+    int16_t previous_id = 0;
+    CompactField field;
+    bool success = true;
+    while (success && reader.read_field(previous_id, field) && 0 != field.type_) {
+      if (1 == field.id_ && 5 == field.type_) {
+        success = compact_integer(reader, page.num_values_);
+      } else if (2 == field.id_ && 5 == field.type_) {
+        success = compact_integer(reader, page.encoding_);
+      } else {
+        success = reader.skip(field.type_);
+      }
+    }
+    return success;
+  }
+
+  static bool parse_parquet_data_page_v2_header(CompactReader &reader, ParquetPage &page)
+  {
+    int16_t previous_id = 0;
+    CompactField field;
+    bool success = true;
+    while (success && reader.read_field(previous_id, field) && 0 != field.type_) {
+      if (1 == field.id_ && 5 == field.type_) {
+        success = compact_integer(reader, page.num_values_);
+      } else if (4 == field.id_ && 5 == field.type_) {
+        success = compact_integer(reader, page.encoding_);
+      } else if (5 == field.id_ && 5 == field.type_) {
+        success = compact_integer(reader, page.definition_length_);
+      } else if (6 == field.id_ && 5 == field.type_) {
+        success = compact_integer(reader, page.repetition_length_);
+      } else if (7 == field.id_ && (1 == field.type_ || 2 == field.type_)) {
+        page.values_compressed_ = field.bool_value_;
+      } else {
+        success = reader.skip(field.type_);
+      }
+    }
+    return success;
+  }
+
+  static bool parse_parquet_page(const std::string &content,
+                                 const size_t offset,
+                                 ParquetPage &page)
+  {
+    CompactReader reader(content, offset, content.size() - 8);
+    int16_t previous_id = 0;
+    CompactField field;
+    bool success = true;
+    while (success && reader.read_field(previous_id, field) && 0 != field.type_) {
+      if (1 == field.id_ && 5 == field.type_) {
+        success = compact_integer(reader, page.type_);
+      } else if (2 == field.id_ && 5 == field.type_) {
+        success = compact_integer(reader, page.uncompressed_size_);
+      } else if (3 == field.id_ && 5 == field.type_) {
+        success = compact_integer(reader, page.compressed_size_);
+      } else if (5 == field.id_ && 12 == field.type_) {
+        success = parse_parquet_data_page_header(reader, page);
+      } else if (8 == field.id_ && 12 == field.type_) {
+        success = parse_parquet_data_page_v2_header(reader, page);
+      } else {
+        success = reader.skip(field.type_);
+      }
+    }
+    page.header_end_ = reader.position();
+    return success && reader.valid() && page.type_ >= 0 && page.compressed_size_ >= 0
+        && page.uncompressed_size_ >= 0 && page.header_end_ <= content.size()
+        && static_cast<size_t>(page.compressed_size_) <= content.size() - page.header_end_;
+  }
+
+  static bool read_unsigned_varint(const std::string &data, size_t &pos, uint64_t &value)
+  {
+    value = 0;
+    for (int shift = 0; shift < 64 && pos < data.size(); shift += 7) {
+      const uint8_t byte = static_cast<uint8_t>(data[pos++]);
+      value |= static_cast<uint64_t>(byte & 0x7F) << shift;
+      if (0 == (byte & 0x80)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool snappy_decompress(const std::string &source, std::string &output)
+  {
+    size_t pos = 0;
+    uint64_t expected_size = 0;
+    bool success = read_unsigned_varint(source, pos, expected_size)
+        && expected_size <= 64 * 1024 * 1024;
+    output.clear();
+    output.reserve(static_cast<size_t>(expected_size));
+    while (success && pos < source.size() && output.size() < expected_size) {
+      const uint8_t tag = static_cast<uint8_t>(source[pos++]);
+      const uint8_t kind = tag & 0x03;
+      size_t length = 0;
+      size_t offset = 0;
+      if (0 == kind) {
+        length = tag >> 2;
+        if (length < 60) {
+          ++length;
+        } else {
+          const size_t length_bytes = length - 59;
+          uint64_t encoded_length = 0;
+          if (length_bytes > 4 || length_bytes > source.size() - pos) {
+            success = false;
+          }
+          for (size_t i = 0; success && i < length_bytes; ++i) {
+            encoded_length |= static_cast<uint64_t>(static_cast<uint8_t>(source[pos++])) << (8 * i);
+          }
+          length = static_cast<size_t>(encoded_length + 1);
+        }
+        if (success && length <= source.size() - pos && length <= expected_size - output.size()) {
+          output.append(source, pos, length);
+          pos += length;
+        } else {
+          success = false;
+        }
+      } else {
+        if (1 == kind) {
+          length = 4 + ((tag >> 2) & 0x07);
+          if (pos >= source.size()) {
+            success = false;
+          } else {
+            offset = ((static_cast<size_t>(tag) & 0xE0) << 3)
+                | static_cast<uint8_t>(source[pos++]);
+          }
+        } else if (2 == kind) {
+          length = 1 + (tag >> 2);
+          if (source.size() - pos < 2) {
+            success = false;
+          } else {
+            offset = static_cast<uint8_t>(source[pos])
+                | (static_cast<size_t>(static_cast<uint8_t>(source[pos + 1])) << 8);
+            pos += 2;
+          }
+        } else {
+          length = 1 + (tag >> 2);
+          if (source.size() - pos < 4) {
+            success = false;
+          } else {
+            offset = read_u32_le(source.data() + pos);
+            pos += 4;
+          }
+        }
+        if (success && offset > 0 && offset <= output.size()
+            && length <= expected_size - output.size()) {
+          for (size_t i = 0; i < length; ++i) {
+            output.push_back(output[output.size() - offset]);
+          }
+        } else {
+          success = false;
+        }
+      }
+    }
+    return success && output.size() == expected_size && pos == source.size();
+  }
+
+  static bool decompress_parquet_values(const int32_t codec,
+                                        const bool compressed,
+                                        const std::string &source,
+                                        std::string &output)
+  {
+    bool success = true;
+    if (!compressed || 0 == codec) {
+      output = source;
+    } else if (1 == codec) {
+      success = snappy_decompress(source, output);
+    } else {
+      success = false;
+    }
+    return success;
+  }
+
+  static bool decode_parquet_levels(const std::string &encoded,
+                                    const int bit_width,
+                                    const size_t count,
+                                    std::vector<int32_t> &levels)
+  {
+    size_t pos = 0;
+    bool success = bit_width >= 0 && bit_width <= 8;
+    while (success && pos < encoded.size() && levels.size() < count) {
+      uint64_t header = 0;
+      success = read_unsigned_varint(encoded, pos, header) && header > 0;
+      if (!success) {
+        break;
+      }
+      if (0 == (header & 1)) {
+        const size_t run = static_cast<size_t>(header >> 1);
+        const size_t width_bytes = static_cast<size_t>((bit_width + 7) / 8);
+        uint32_t value = 0;
+        if (width_bytes > encoded.size() - pos || run > count - levels.size()) {
+          success = false;
+        }
+        for (size_t i = 0; success && i < width_bytes; ++i) {
+          value |= static_cast<uint32_t>(static_cast<uint8_t>(encoded[pos++])) << (8 * i);
+        }
+        for (size_t i = 0; success && i < run; ++i) {
+          levels.push_back(static_cast<int32_t>(value));
+        }
+      } else {
+        const size_t groups = static_cast<size_t>(header >> 1);
+        const size_t values = groups * 8;
+        const size_t bytes = (values * static_cast<size_t>(bit_width) + 7) / 8;
+        if (bytes > encoded.size() - pos) {
+          success = false;
+        }
+        for (size_t i = 0; success && i < values; ++i) {
+          uint32_t value = 0;
+          for (int bit = 0; bit < bit_width; ++bit) {
+            const size_t bit_pos = i * static_cast<size_t>(bit_width) + bit;
+            value |= ((static_cast<uint8_t>(encoded[pos + bit_pos / 8]) >> (bit_pos % 8)) & 1) << bit;
+          }
+          if (levels.size() < count) {
+            levels.push_back(static_cast<int32_t>(value));
+          }
+        }
+        pos += bytes;
+      }
+    }
+    return success && levels.size() == count;
+  }
+
+  static std::string parquet_number(const double value, const int precision)
+  {
+    std::ostringstream stream;
+    stream << std::setprecision(precision) << value;
+    return stream.str();
+  }
+
+  static bool decode_parquet_plain(const std::string &data,
+                                   const ParquetSchema &schema,
+                                   const std::vector<int32_t> &definition_levels,
+                                   std::vector<Cell> &cells)
+  {
+    const int32_t max_definition = 1 == schema.repetition_ ? 1 : 0;
+    size_t pos = 0;
+    size_t boolean_bit = 0;
+    bool success = true;
+    for (size_t i = 0; success && i < definition_levels.size(); ++i) {
+      if (definition_levels[i] < max_definition) {
+        cells.push_back(Cell());
+      } else if (0 == schema.type_) {
+        if (boolean_bit / 8 >= data.size()) {
+          success = false;
+        } else {
+          const bool value = 0 != ((static_cast<uint8_t>(data[boolean_bit / 8])
+              >> (boolean_bit % 8)) & 1);
+          cells.push_back(Cell(value ? "true" : "false"));
+          ++boolean_bit;
+          pos = (boolean_bit + 7) / 8;
+        }
+      } else if (1 == schema.type_) {
+        if (data.size() - pos < 4) {
+          success = false;
+        } else {
+          cells.push_back(Cell(std::to_string(static_cast<int32_t>(read_u32_le(data.data() + pos)))));
+          pos += 4;
+        }
+      } else if (2 == schema.type_) {
+        if (data.size() - pos < 8) {
+          success = false;
+        } else {
+          cells.push_back(Cell(std::to_string(static_cast<int64_t>(read_u64_le(data.data() + pos)))));
+          pos += 8;
+        }
+      } else if (4 == schema.type_) {
+        if (data.size() - pos < 4) {
+          success = false;
+        } else {
+          const uint32_t bits = read_u32_le(data.data() + pos);
+          float value = 0;
+          MEMCPY(&value, &bits, sizeof(value));
+          cells.push_back(Cell(parquet_number(value, std::numeric_limits<float>::max_digits10)));
+          pos += 4;
+        }
+      } else if (5 == schema.type_) {
+        if (data.size() - pos < 8) {
+          success = false;
+        } else {
+          const uint64_t bits = read_u64_le(data.data() + pos);
+          double value = 0;
+          MEMCPY(&value, &bits, sizeof(value));
+          cells.push_back(Cell(parquet_number(value, std::numeric_limits<double>::max_digits10)));
+          pos += 8;
+        }
+      } else if (6 == schema.type_) {
+        if (data.size() - pos < 4) {
+          success = false;
+        } else {
+          const uint32_t length = read_u32_le(data.data() + pos);
+          pos += 4;
+          if (length > data.size() - pos) {
+            success = false;
+          } else {
+            cells.push_back(Cell(data.substr(pos, length)));
+            pos += length;
+          }
+        }
+      } else if (7 == schema.type_ && schema.type_length_ > 0) {
+        const size_t length = static_cast<size_t>(schema.type_length_);
+        if (length > data.size() - pos) {
+          success = false;
+        } else {
+          cells.push_back(Cell(data.substr(pos, length)));
+          pos += length;
+        }
+      } else {
+        success = false;
+      }
+    }
+    return success && cells.size() == definition_levels.size();
+  }
+
+  static bool decode_parquet_column(const std::string &content,
+                                    const ParquetSchema &schema,
+                                    const ParquetChunk &chunk,
+                                    const int64_t row_count,
+                                    std::vector<Cell> &cells)
+  {
+    size_t offset = static_cast<size_t>(chunk.dictionary_page_offset_ >= 0
+        ? chunk.dictionary_page_offset_ : chunk.data_page_offset_);
+    bool success = row_count >= 0 && chunk.num_values_ >= row_count;
+    while (success && cells.size() < static_cast<size_t>(row_count)) {
+      ParquetPage page;
+      success = parse_parquet_page(content, offset, page);
+      if (!success) {
+        break;
+      }
+      const size_t payload_begin = page.header_end_;
+      const size_t payload_end = payload_begin + static_cast<size_t>(page.compressed_size_);
+      offset = payload_end;
+      if (2 == page.type_) {
+        continue;
+      }
+      if ((0 != page.type_ && 3 != page.type_) || 0 != page.encoding_
+          || page.num_values_ < 0 || static_cast<size_t>(page.num_values_) > row_count - cells.size()) {
+        success = false;
+        break;
+      }
+
+      std::string values;
+      std::vector<int32_t> levels;
+      const int32_t max_definition = 1 == schema.repetition_ ? 1 : 0;
+      if (3 == page.type_) {
+        const size_t levels_size = static_cast<size_t>(page.repetition_length_)
+            + static_cast<size_t>(page.definition_length_);
+        if (page.repetition_length_ < 0 || page.definition_length_ < 0
+            || levels_size > static_cast<size_t>(page.compressed_size_)) {
+          success = false;
+          break;
+        }
+        if (max_definition > 0) {
+          const size_t definition_begin = payload_begin + static_cast<size_t>(page.repetition_length_);
+          success = decode_parquet_levels(
+              content.substr(definition_begin, static_cast<size_t>(page.definition_length_)),
+              1, static_cast<size_t>(page.num_values_), levels);
+        } else {
+          levels.assign(static_cast<size_t>(page.num_values_), 0);
+        }
+        const std::string compressed_values = content.substr(payload_begin + levels_size,
+            static_cast<size_t>(page.compressed_size_) - levels_size);
+        success = success && decompress_parquet_values(
+            chunk.codec_, page.values_compressed_, compressed_values, values);
+      } else {
+        std::string payload;
+        success = decompress_parquet_values(chunk.codec_, true,
+            content.substr(payload_begin, static_cast<size_t>(page.compressed_size_)), payload);
+        size_t pos = 0;
+        if (success && max_definition > 0) {
+          if (payload.size() - pos < 4) {
+            success = false;
+          } else {
+            const uint32_t level_size = read_u32_le(payload.data() + pos);
+            pos += 4;
+            if (level_size > payload.size() - pos) {
+              success = false;
+            } else {
+              success = decode_parquet_levels(payload.substr(pos, level_size), 1,
+                  static_cast<size_t>(page.num_values_), levels);
+              pos += level_size;
+            }
+          }
+        } else if (success) {
+          levels.assign(static_cast<size_t>(page.num_values_), 0);
+        }
+        if (success) {
+          values.assign(payload, pos, std::string::npos);
+        }
+      }
+      if (success) {
+        std::vector<Cell> page_cells;
+        success = decode_parquet_plain(values, schema, levels, page_cells);
+        cells.insert(cells.end(), page_cells.begin(), page_cells.end());
+      }
+    }
+    return success && cells.size() == static_cast<size_t>(row_count);
+  }
+
+  static int parse_parquet(const std::string &content, Relation &relation)
+  {
+    int ret = OB_SUCCESS;
+    if (content.size() < 12 || 0 != content.compare(0, 4, "PAR1")
+        || 0 != content.compare(content.size() - 4, 4, "PAR1")) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      const uint32_t footer_size = read_u32_le(content.data() + content.size() - 8);
+      if (footer_size > content.size() - 12) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        const size_t footer_begin = content.size() - 8 - footer_size;
+        std::vector<ParquetSchema> schemas;
+        std::vector<ParquetRowGroup> row_groups;
+        if (!parse_parquet_footer(content, footer_begin, schemas, row_groups)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          std::map<std::string, ParquetSchema> schema_by_name;
+          for (size_t i = 1; i < schemas.size(); ++i) {
+            schema_by_name[schemas[i].name_] = schemas[i];
+            relation.columns_.push_back(schemas[i].name_);
+          }
+          uniquify_columns(relation.columns_);
+          for (const ParquetRowGroup &row_group : row_groups) {
+            if (row_group.chunks_.size() != schemas.size() - 1) {
+              ret = OB_NOT_SUPPORTED;
+              break;
+            }
+            std::vector<std::vector<Cell> > columns;
+            for (const ParquetChunk &chunk : row_group.chunks_) {
+              const std::map<std::string, ParquetSchema>::const_iterator schema_it
+                  = schema_by_name.find(chunk.path_);
+              std::vector<Cell> cells;
+              if (schema_it == schema_by_name.end()
+                  || schema_it->second.type_ != chunk.type_
+                  || !decode_parquet_column(content, schema_it->second, chunk,
+                                             row_group.num_rows_, cells)) {
+                ret = OB_NOT_SUPPORTED;
+                break;
+              }
+              columns.push_back(cells);
+            }
+            for (int64_t row = 0; OB_SUCC(ret) && row < row_group.num_rows_; ++row) {
+              std::vector<Cell> cells;
+              for (size_t column = 0; column < columns.size(); ++column) {
+                cells.push_back(columns[column][static_cast<size_t>(row)]);
+              }
+              relation.rows_.push_back(cells);
+            }
+          }
+        }
+      }
+    }
+    if (OB_FAIL(ret)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                     "Parquet reader supports flat PLAIN columns with uncompressed or Snappy pages");
+    }
+    return ret;
+  }
+
   static void uniquify_columns(std::vector<std::string> &columns)
   {
     std::map<std::string, int64_t> counts;
@@ -978,23 +1862,78 @@ private:
     return "CAST(" + value + " AS " + sql_type(type) + ")";
   }
 
+  static std::vector<ValueType> infer_relation_types(const Relation &relation)
+  {
+    std::vector<ValueType> types(relation.columns_.size(), ValueType::NULL_VALUE);
+    for (const std::vector<Cell> &row : relation.rows_) {
+      for (size_t i = 0; i < types.size(); ++i) {
+        types[i] = merge_type(types[i], classify(row[i]));
+      }
+    }
+    for (ValueType &type : types) {
+      if (ValueType::NULL_VALUE == type) {
+        type = ValueType::STRING;
+      }
+    }
+    return types;
+  }
+
+  static std::string describe_type(const ValueType type)
+  {
+    std::string result;
+    switch (type) {
+      case ValueType::BOOL: result = "BOOLEAN"; break;
+      case ValueType::INT: result = "BIGINT"; break;
+      case ValueType::DOUBLE: result = "DOUBLE"; break;
+      case ValueType::DATE: result = "DATE"; break;
+      case ValueType::DATETIME: result = "DATETIME"; break;
+      case ValueType::NULL_VALUE:
+      case ValueType::STRING:
+      default: result = "VARCHAR"; break;
+    }
+    return result;
+  }
+
+  static int relation_to_schema_sql(const Relation &relation, std::string &sql)
+  {
+    int ret = OB_SUCCESS;
+    if (relation.columns_.empty()) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      const std::vector<ValueType> types = infer_relation_types(relation);
+      sql.clear();
+      for (size_t column = 0; column < relation.columns_.size(); ++column) {
+        bool nullable = false;
+        for (size_t row = 0; !nullable && row < relation.rows_.size(); ++row) {
+          nullable = relation.rows_[row][column].is_null_;
+        }
+        if (column > 0) {
+          sql.append(" UNION ALL ");
+        }
+        sql.append("SELECT ").append(quote_string(relation.columns_[column]));
+        if (0 == column) sql.append(" AS ").append(quote_identifier("column_name"));
+        sql.append(", ").append(quote_string(describe_type(types[column])));
+        if (0 == column) sql.append(" AS ").append(quote_identifier("column_type"));
+        sql.append(", ").append(quote_string(nullable ? "YES" : "NO"));
+        if (0 == column) sql.append(" AS ").append(quote_identifier("null"));
+        sql.append(", CAST(NULL AS CHAR)");
+        if (0 == column) sql.append(" AS ").append(quote_identifier("key"));
+        sql.append(", CAST(NULL AS CHAR)");
+        if (0 == column) sql.append(" AS ").append(quote_identifier("default"));
+        sql.append(", CAST(NULL AS CHAR)");
+        if (0 == column) sql.append(" AS ").append(quote_identifier("extra"));
+      }
+    }
+    return ret;
+  }
+
   static int relation_to_sql(const Relation &relation, std::string &sql)
   {
     int ret = OB_SUCCESS;
     if (relation.columns_.empty()) {
       ret = OB_ERR_UNEXPECTED;
     } else {
-      std::vector<ValueType> types(relation.columns_.size(), ValueType::NULL_VALUE);
-      for (const std::vector<Cell> &row : relation.rows_) {
-        for (size_t i = 0; i < types.size(); ++i) {
-          types[i] = merge_type(types[i], classify(row[i]));
-        }
-      }
-      for (ValueType &type : types) {
-        if (ValueType::NULL_VALUE == type) {
-          type = ValueType::STRING;
-        }
-      }
+      const std::vector<ValueType> types = infer_relation_types(relation);
 
       sql.assign("(");
       if (relation.rows_.empty()) {
@@ -1053,7 +1992,8 @@ private:
   static int build_relation(const std::string &args,
                             const Kind kind,
                             sql::ObSQLSessionInfo &session,
-                            std::string &sql)
+                            std::string &sql,
+                            const bool describe = false)
   {
     int ret = OB_SUCCESS;
     const std::vector<std::string> values = split_args(args);
@@ -1090,7 +2030,9 @@ private:
       } else if (OB_FAIL(read_file(canonical, content))) {
       } else if (Kind::CSV == kind && OB_FAIL(parse_csv(content, relation))) {
       } else if (Kind::JSONL == kind && OB_FAIL(parse_jsonl(content, relation))) {
-      } else if (OB_FAIL(relation_to_sql(relation, sql))) {
+      } else if (Kind::PARQUET == kind && OB_FAIL(parse_parquet(content, relation))) {
+      } else if (describe && OB_FAIL(relation_to_schema_sql(relation, sql))) {
+      } else if (!describe && OB_FAIL(relation_to_sql(relation, sql))) {
       }
     }
     return ret;
