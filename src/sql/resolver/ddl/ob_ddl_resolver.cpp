@@ -1966,6 +1966,15 @@ int ObDDLResolver::resolve_column_definition(ObColumnSchemaV2 &column,
       }
     }
   }
+  if (OB_SUCC(ret)) {
+    const ObString column_name = column.get_column_name_str();
+    static const char *AI_HIDDEN_PREFIX = "__ai_";
+    static const int64_t AI_HIDDEN_PREFIX_LENGTH = 5;
+    if (column_name.length() > AI_HIDDEN_PREFIX_LENGTH &&
+        0 == MEMCMP(column_name.ptr(), AI_HIDDEN_PREFIX, AI_HIDDEN_PREFIX_LENGTH)) {
+      column.set_is_hidden(true);
+    }
+  }
   return ret;
 }
 
