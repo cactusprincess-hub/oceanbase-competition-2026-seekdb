@@ -1,0 +1,50 @@
+name: Competition Linux check
+
+on:
+  push:
+    branches: [codex/linux-evaluation-check]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare Linux build environment
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          sudo apt-get update
+          sudo apt-get install -y rpm rpm2cpio cpio make build-essential binutils m4 libtool-bin libncurses5
+          df -h .
+          free -h
+      - uses: ./.github/actions/setup-rust
+      - name: Restore dependency cache
+        uses: actions/cache@v4
+        with:
+          path: deps/3rd
+          key: competition-linux-deps-${{ hashFiles('deps/init/oceanbase.el9.x86_64.deps') }}
+      - name: Initialize dependencies and CMake
+        run: |
+          set -o pipefail
+          ./build.sh release --init 2>&1 | tee linux-configure.log
+      - name: Analyze Bazel production target
+        run: |
+          set -o pipefail
+          curl -fL --retry 3 https://releases.bazel.build/8.2.1/release/bazel-8.2.1-linux-x86_64 -o /tmp/bazel-8.2.1
+          chmod +x /tmp/bazel-8.2.1
+          /tmp/bazel-8.2.1 build --nobuild //src/observer:seekdb_link 2>&1 | tee linux-bazel-analysis.log
+      - name: Compile release binary
+        run: |
+          set -o pipefail
+          cmake --build build_release --target seekdb -j2 2>&1 | tee linux-build.log
+          build_release/src/observer/seekdb --version
+      - name: Save diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-build-diagnostics
+          path: linux-*.log
