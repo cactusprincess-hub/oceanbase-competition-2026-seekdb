@@ -34,6 +34,7 @@
 #include "share/ob_server_struct.h"
 #include "share/ob_errno.h"
 #include "sql/session/ob_sql_session_info.h"
+#include "sql/parser/ob_parser.h"
 
 namespace oceanbase
 {
@@ -75,7 +76,7 @@ public:
       } else {
         rewritten = true;
       }
-    } else if (strict_read_enabled(session) && OB_FAIL(check_strict_read(sql))) {
+    } else if (strict_read_enabled(session) && OB_FAIL(check_strict_read(sql, session, default_database))) {
     } else if (contains_ci(lower, "oceanbase.__all_ai_column_task")) {
       std::string metadata_sql;
       if (OB_FAIL(rewrite_task_query(sql, metadata_sql))) {
@@ -895,16 +896,77 @@ private:
     return ret;
   }
 
-  static int check_strict_read(const std::string &sql)
+  static int check_strict_read(const std::string &query,
+                               const sql::ObSQLSessionInfo &session,
+                               const std::string &default_database)
   {
     int ret = OB_SUCCESS;
+    common::ObArenaAllocator allocator("AiColumnRead");
+    sql::ObParser parser(allocator, session.get_sql_mode(), session.get_charsets4parser());
+    ParseResult parsed;
+    if (OB_SUCCESS != parser.parse(common::ObString(query.size(), query.data()), parsed, STD_MODE, false, true)) {
+      // Extended AI DDL is rewritten below; ordinary syntax errors belong to the normal parser.
+      return ret;
+    }
+    struct ReadTable { std::string database; std::string table; std::string alias; };
+    struct ReadColumn { std::string database; std::string table; std::string column; };
+    std::vector<ReadTable> tables;
+    std::vector<ReadColumn> columns;
+    const auto name = [](const ParseNode *node) {
+      return nullptr == node || nullptr == node->str_value_ ? std::string() :
+          std::string(node->str_value_, node->str_len_);
+    };
+    std::vector<const ParseNode *> pending(1, parsed.result_tree_);
+    bool select_all = false;
+    while (!pending.empty()) {
+      const ParseNode *node = pending.back();
+      pending.pop_back();
+      if (nullptr == node) {
+        continue;
+      }
+      const ParseNode *relation = node;
+      std::string alias;
+      bool aliased_table = T_ALIAS == node->type_ && node->num_child_ >= 2 &&
+          nullptr != node->children_[0] && T_RELATION_FACTOR == node->children_[0]->type_;
+      if (aliased_table) {
+        relation = node->children_[0];
+        alias = name(node->children_[1]);
+      }
+      if (T_RELATION_FACTOR == relation->type_ && relation->num_child_ >= 2 &&
+          nullptr != relation->children_[1]) {
+        const std::string database = name(relation->children_[0]);
+        tables.push_back({database.empty() ? default_database : database,
+                          name(relation->children_[1]), alias});
+      } else if (T_COLUMN_REF == node->type_ && node->num_child_ >= 3 &&
+                 nullptr != node->children_[2]) {
+        const ParseNode *column = node->children_[2];
+        columns.push_back({name(node->children_[0]), name(node->children_[1]),
+                           T_STAR == column->type_ ? "*" : name(column)});
+      } else if (T_PROJECT_STRING == node->type_ && node->num_child_ >= 1 &&
+                 nullptr != node->children_[0] && T_STAR == node->children_[0]->type_) {
+        select_all = true;
+      }
+      for (int32_t i = aliased_table ? 1 : 0; i < node->num_child_; ++i) {
+        pending.push_back(node->children_[i]);
+      }
+    }
     std::vector<Definition> snapshot;
     {
       std::lock_guard<std::mutex> guard(definitions_mutex());
       snapshot = definitions();
     }
     for (const Definition &definition : snapshot) {
-      if (OB_FAIL(ret) || !references_identifier(sql, definition.column_) ||
+      const bool column_referenced = tables.end() != std::find_if(tables.begin(), tables.end(),
+          [&](const ReadTable &table) {
+            return equal_ci(table.database, definition.database_) && equal_ci(table.table, definition.table_) &&
+                (select_all || columns.end() != std::find_if(columns.begin(), columns.end(),
+                    [&](const ReadColumn &column) {
+                      return ("*" == column.column || equal_ci(column.column, definition.column_)) &&
+                          (column.table.empty() || equal_ci(column.table, table.alias.empty() ? table.table : table.alias)) &&
+                          (column.database.empty() || equal_ci(column.database, table.database));
+                    }));
+          });
+      if (OB_FAIL(ret) || !column_referenced ||
           nullptr == GCTX.sql_proxy_ || !GCTX.sql_proxy_->is_inited()) {
         continue;
       }
@@ -930,6 +992,7 @@ private:
                        static_cast<uint64_t>(0), static_cast<uint64_t>(0));
       }
     }
+    parser.free_result(parsed);
     return ret;
   }
 
