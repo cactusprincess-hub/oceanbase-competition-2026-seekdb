@@ -12,10 +12,33 @@ sys.modules[spec.name] = runner
 spec.loader.exec_module(runner)
 label = sys.argv[1]
 cases = [case for case in runner.discover_cases(root) if case.name.startswith("ai_column.")]
+regression = root / "unittest/sql/ai_column"
+if regression.is_dir():
+    cases.append(runner.MysqltestCase("ai_column.ai_column_scheduling",
+        regression / "t/ai_column_scheduling.test",
+        regression / "r/mysql/ai_column_scheduling.result"))
 if len(sys.argv) > 2 and sys.argv[2] == "critical":
     cases = [case for case in cases if case.name in (
         "ai_column.ai_column_worker", "ai_column.ai_column_retry_strict",
         "ai_column.ai_column_scheduling")]
+    order = {"ai_column.ai_column_worker": 0,
+             "ai_column.ai_column_retry_strict": 1,
+             "ai_column.ai_column_scheduling": 2}
+    cases.sort(key=lambda case: order[case.name])
+if len(sys.argv) > 2 and sys.argv[2] == "cascade":
+    by_name = {case.name: case for case in cases}
+    cases = [by_name["ai_column.ai_column_worker"],
+             by_name["ai_column.ai_column_retry_strict"]]
+    original_prepare = runner.prepare_instance
+    prepared = False
+
+    def prepare_once(*arguments):
+        global prepared
+        if not prepared:
+            original_prepare(*arguments)
+            prepared = True
+
+    runner.prepare_instance = prepare_once
 runner.discover_cases = lambda _: cases
 runner.MAX_CASE_RETRIES = 0
 original_sdb = runner.run_sdb

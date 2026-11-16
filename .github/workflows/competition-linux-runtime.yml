@@ -1,0 +1,90 @@
+name: Competition Linux runtime check
+
+on:
+  push:
+    branches: [codex/linux-evaluation-check]
+    paths:
+      - .github/workflows/competition-linux-runtime.yml
+      - tools/deploy/mysql_test/test_suite/ai_column/**
+      - unittest/sql/ai_column/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install client runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libncurses5
+      - name: Download previous Linux runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-ai-column-runtime
+          run-id: 43877537059
+          github-token: ${{ github.token }}
+      - name: Reproduce worker then strict-read without a server reset
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          chmod +x build_release/src/observer/seekdb deps/3rd/u01/obclient/bin/*
+          python3 .github/script/seekdb/competition_ai_column_check.py previous-cascade cascade 2>&1 | tee linux-ai-column-previous-cascade.log
+      - name: Save baseline diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-baseline-cascade-diagnostics
+          retention-days: 5
+          path: |
+            linux-ai-column-*.log
+            linux-ai-column-*/
+  regression:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check compiled database source is unchanged
+        run: git diff --exit-code c53be62a5c502caa6a9010e5329c1c9795e0b64d -- src/
+      - name: Install client runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libncurses5
+      - name: Download compiled Linux runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-ai-column-runtime
+          run-id: 43886901428
+          github-token: ${{ github.token }}
+      - name: Check executable runtime
+        run: |
+          chmod +x build_release/src/observer/seekdb deps/3rd/u01/obclient/bin/*
+          build_release/src/observer/seekdb --version
+          deps/3rd/u01/obclient/bin/obclient --version
+      - name: Run the complete AI column suite
+        run: |
+          set -o pipefail
+          python3 .github/script/seekdb/competition_ai_column_check.py runtime-full 2>&1 | tee linux-ai-column-runtime-full.log
+      - name: Repeat scheduling, worker and strict-read cases
+        run: |
+          set -o pipefail
+          for iteration in 1 2 3; do
+            python3 .github/script/seekdb/competition_ai_column_check.py runtime-repeat-$iteration critical 2>&1 | tee linux-ai-column-runtime-repeat-$iteration.log
+          done
+      - name: Save runtime diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-runtime-diagnostics
+          retention-days: 5
+          path: |
+            linux-ai-column-*.log
+            linux-ai-column-*/

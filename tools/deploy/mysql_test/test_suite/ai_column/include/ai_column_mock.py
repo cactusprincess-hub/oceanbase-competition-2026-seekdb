@@ -119,6 +119,9 @@ def serve(port):
             with lock:
                 attempts[key] = attempts.get(key, 0) + 1
                 attempt = attempts[key]
+                fresh_seen = any(
+                    name.endswith("|fresh-work") for name in attempts
+                )
 
             if "slow-old" in user_text:
                 time.sleep(1.2)
@@ -127,6 +130,8 @@ def serve(port):
 
             fail = "always-fail" in parsed.path or (
                 "retry-once" in user_text and attempt == 1
+            ) or (
+                "retry-until-fresh" in user_text and not fresh_seen
             )
             if fail:
                 status = 400
@@ -213,6 +218,12 @@ def assert_events(port, assertion):
         ok = (
             len(retry_events) == 2
             and [event["status"] for event in retry_events] == [400, 200]
+        )
+    elif assertion == "fresh-before-retry":
+        ok = (
+            [(event["user"], event["status"]) for event in events]
+            == [("retry-until-fresh", 400), ("fresh-work", 200),
+                ("retry-until-fresh", 200)]
         )
     elif assertion == "stale-guard":
         ok = (
