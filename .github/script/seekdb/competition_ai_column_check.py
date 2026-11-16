@@ -12,6 +12,10 @@ sys.modules[spec.name] = runner
 spec.loader.exec_module(runner)
 label = sys.argv[1]
 cases = [case for case in runner.discover_cases(root) if case.name.startswith("ai_column.")]
+if len(sys.argv) > 2 and sys.argv[2] == "critical":
+    cases = [case for case in cases if case.name in (
+        "ai_column.ai_column_worker", "ai_column.ai_column_retry_strict",
+        "ai_column.ai_column_scheduling")]
 runner.discover_cases = lambda _: cases
 runner.MAX_CASE_RETRIES = 0
 original_sdb = runner.run_sdb

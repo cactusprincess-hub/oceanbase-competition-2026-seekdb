@@ -12,6 +12,9 @@ jobs:
   linux-build:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
+    env:
+      CCACHE_DIR: /home/runner/.cache/competition-ccache
+      CCACHE_MAXSIZE: 3G
     steps:
       - uses: actions/checkout@v4
         with:
@@ -20,7 +23,7 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
           sudo apt-get update
-          sudo apt-get install -y rpm rpm2cpio cpio make build-essential binutils m4 libtool-bin libncurses5
+          sudo apt-get install -y rpm rpm2cpio cpio make build-essential binutils m4 libtool-bin libncurses5 ccache
           df -h .
           free -h
       - uses: ./.github/actions/setup-rust
@@ -33,34 +36,41 @@ jobs:
         run: |
           set -o pipefail
           ./build.sh release --init 2>&1 | tee linux-configure.log
+          cmake -S . -B build_release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
+      - name: Restore compiler cache
+        id: compiler-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /home/runner/.cache/competition-ccache
+          key: competition-linux-ccache-v1-${{ github.sha }}
+          restore-keys: competition-linux-ccache-v1-
       - name: Analyze Bazel production target
         run: |
           set -o pipefail
           curl -fL --retry 3 https://releases.bazel.build/8.2.1/release/bazel-8.2.1-linux-x86_64 -o /tmp/bazel-8.2.1
           chmod +x /tmp/bazel-8.2.1
           /tmp/bazel-8.2.1 build --nobuild //src/observer:seekdb_link 2>&1 | tee linux-bazel-analysis.log
-      - name: Stage the previously submitted worker for comparison
-        run: git show be3d5a70e:src/observer/mysql/ai_column_sql_rewriter.h > src/observer/mysql/ai_column_sql_rewriter.h
-      - name: Compile previous release binary
+      - name: Compile release binary
         run: |
           set -o pipefail
           cmake --build build_release --target seekdb -j3 2>&1 | tee linux-build.log
           build_release/src/observer/seekdb --version
-      - name: Reproduce AI column regressions before the thread change
-        id: baseline
-        continue-on-error: true
-        run: |
-          set -o pipefail
-          python3 .github/script/seekdb/competition_ai_column_check.py baseline 2>&1 | tee linux-ai-column-baseline.log
-      - name: Rebuild with the worker thread change
-        run: |
-          set -o pipefail
-          git restore src/observer/mysql/ai_column_sql_rewriter.h
-          cmake --build build_release --target seekdb -j3 2>&1 | tee linux-build-worker-fix.log
       - name: Run AI column regression on Linux
         run: |
           set -o pipefail
-          python3 .github/script/seekdb/competition_ai_column_check.py fixed 2>&1 | tee linux-ai-column-fixed.log
+          python3 .github/script/seekdb/competition_ai_column_check.py scheduling 2>&1 | tee linux-ai-column-scheduling.log
+      - name: Repeat worker and strict-read regression on fresh instances
+        run: |
+          set -o pipefail
+          for iteration in 1 2 3; do
+            python3 .github/script/seekdb/competition_ai_column_check.py repeat-$iteration critical 2>&1 | tee linux-ai-column-repeat-$iteration.log
+          done
+      - name: Save compiler cache
+        if: always() && steps.compiler-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/.cache/competition-ccache
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
       - name: Save reusable Linux runtime
         if: always()
         uses: actions/upload-artifact@v4
