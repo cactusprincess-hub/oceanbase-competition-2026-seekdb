@@ -136,6 +136,7 @@ private:
     std::string runtime_state_column_;
     std::string runtime_request_column_;
     std::string runtime_retry_column_;
+    std::string runtime_eligible_column_;
     int64_t max_retries_;
   };
 
@@ -476,6 +477,7 @@ private:
         definition.runtime_state_column_ = "_ai_runtime_state_" + definition.column_;
         definition.runtime_request_column_ = "_ai_runtime_request_" + definition.column_;
         definition.runtime_retry_column_ = "_ai_runtime_retry_" + definition.column_;
+        definition.runtime_eligible_column_ = "_ai_runtime_eligible_" + definition.column_;
         const std::string lower_type = lower_ascii(definition.result_type_);
         if (std::string::npos != lower_type.find("json")) {
           const size_t close = definition.execution_expr_.rfind(')');
@@ -507,7 +509,8 @@ private:
            quote_identifier(definition.result_spec_column_) + " VARCHAR(2048), " +
            quote_identifier(definition.runtime_state_column_) + " TINYINT NOT NULL DEFAULT 0, " +
            quote_identifier(definition.runtime_request_column_) + " VARCHAR(128), " +
-           quote_identifier(definition.runtime_retry_column_) + " INT NOT NULL DEFAULT 0";
+           quote_identifier(definition.runtime_retry_column_) + " INT NOT NULL DEFAULT 0, " +
+           quote_identifier(definition.runtime_eligible_column_) + " DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6)";
   }
 
   static void replace_definitions(const std::string &database,
@@ -575,7 +578,8 @@ private:
           equal_ci(column, definition.result_spec_column_) ||
           equal_ci(column, definition.runtime_state_column_) ||
           equal_ci(column, definition.runtime_request_column_) ||
-          equal_ci(column, definition.runtime_retry_column_)) {
+          equal_ci(column, definition.runtime_retry_column_) ||
+          equal_ci(column, definition.runtime_eligible_column_)) {
         managed = true;
         break;
       }
@@ -797,6 +801,7 @@ private:
             output.append(", ").append(quote_identifier(definition.runtime_request_column_))
                   .append(" = CONCAT('ai-', CAST(`id` AS CHAR))");
             output.append(", ").append(quote_identifier(definition.runtime_retry_column_)).append(" = 0");
+            output.append(", ").append(quote_identifier(definition.runtime_eligible_column_)).append(" = NOW(6)");
           }
           if (std::string::npos != where_pos) {
             output.append(" ").append(sql.substr(where_pos));
@@ -878,7 +883,8 @@ private:
         output.append(quote_identifier(target->runtime_state_column_)).append(" = 1, ");
         output.append(quote_identifier(target->runtime_request_column_))
               .append(" = CONCAT('ai-', CAST(`id` AS CHAR)), ");
-        output.append(quote_identifier(target->runtime_retry_column_)).append(" = 0");
+        output.append(quote_identifier(target->runtime_retry_column_)).append(" = 0, ");
+        output.append(quote_identifier(target->runtime_eligible_column_)).append(" = NOW(6)");
         if (!predicate.empty()) {
           output.append(" WHERE ").append(predicate);
         }
@@ -1132,7 +1138,7 @@ private:
         }
         result.append("SELECT ").append(table_id_sql(definition)).append(" table_id, ");
         result.append(column_id_sql(definition, definition.column_)).append(" column_id, ");
-        result.append("NOW(6) eligible_ts, ");
+        result.append(quote_identifier(definition.runtime_eligible_column_)).append(" eligible_ts, ");
         result.append(quote_identifier(definition.runtime_state_column_)).append(" state, ");
         result.append(quote_identifier(definition.runtime_retry_column_)).append(" retry_count, ");
         result.append(quote_identifier(definition.runtime_request_column_)).append(" request_id, ");
@@ -1172,8 +1178,11 @@ private:
       if (i > 0) {
         result.append(" OR ");
       }
-      result.append(quote_identifier(table_definitions[i].runtime_state_column_))
-            .append(" IN (1, 3)");
+      const Definition &definition = table_definitions[i];
+      const std::string state = quote_identifier(definition.runtime_state_column_);
+      result.append("(").append(state).append(" = 1 OR (").append(state)
+            .append(" = 3 AND ").append(quote_identifier(definition.runtime_eligible_column_))
+            .append(" <= NOW(6)))");
     }
     result.push_back(')');
     return result;
@@ -1205,6 +1214,7 @@ private:
       sql.append(", ").append(quote_identifier(definition.runtime_state_column_)).append(" = 0");
       sql.append(", ").append(quote_identifier(definition.runtime_request_column_)).append(" = NULL");
       sql.append(", ").append(quote_identifier(definition.runtime_retry_column_)).append(" = 0");
+      sql.append(", ").append(quote_identifier(definition.runtime_eligible_column_)).append(" = NULL");
     }
     sql.append(" WHERE ").append(pending_predicate(table_definitions));
     sql.append(" ORDER BY `id` LIMIT 1");
@@ -1224,6 +1234,10 @@ private:
       }
       const std::string state = quote_identifier(definition.runtime_state_column_);
       const std::string retry = quote_identifier(definition.runtime_retry_column_);
+      const std::string eligible = quote_identifier(definition.runtime_eligible_column_);
+      // Backoff belongs to the failed row, so fresh work can run on the next poll.
+      sql.append(eligible).append(" = IF(").append(state)
+         .append(" IN (1, 3), DATE_ADD(NOW(6), INTERVAL 1 SECOND), ").append(eligible).append("), ");
       sql.append(retry).append(" = IF(").append(state)
          .append(" IN (1, 3), ").append(retry).append(" + 1, ").append(retry).append("), ");
       sql.append(state).append(" = IF(").append(state).append(" IN (1, 3), IF(")
@@ -1238,7 +1252,6 @@ private:
   static void worker_loop()
   {
     while (true) {
-      bool failed_request = false;
       if (nullptr != GCTX.sql_proxy_ && GCTX.sql_proxy_->is_inited()) {
         std::vector<Definition> snapshot;
         {
@@ -1268,11 +1281,10 @@ private:
             int64_t failure_rows = 0;
             (void)GCTX.sql_proxy_->write(
                 common::ObString::make_string(failure_sql.c_str()), failure_rows);
-            failed_request = true;
           }
         }
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(failed_request ? 1000 : 100));
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   }
 

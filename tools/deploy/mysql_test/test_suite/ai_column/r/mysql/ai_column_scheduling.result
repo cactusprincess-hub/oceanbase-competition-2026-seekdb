@@ -1,0 +1,22 @@
+create database ai_column_scheduling;
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('scheduling_model',
+'{"type":"completion","model_name":"mock-complete"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('scheduling_ep',
+'{"ai_model_name":"scheduling_model","url":"http://127.0.0.1:19125/v1/chat/completions","access_key":"scheduling-key","provider":"openai"}');
+create table ai_column_scheduling.docs(
+id bigint primary key,
+content varchar(200),
+result varchar(400) AI COLUMN (
+AI_COMPLETE('scheduling_model', content)
+) WITH (sync_mode='async', max_retries=100)
+);
+insert into ai_column_scheduling.docs(id, content)
+values(1, 'retry-until-fresh'), (2, 'fresh-work');
+select 1 = 1 as fresh_work_unblocks_retry;
+fresh_work_unblocks_retry
+1
+mock_fresh_before_retry=ok
+drop table ai_column_scheduling.docs;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('scheduling_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('scheduling_model');
+drop database ai_column_scheduling;

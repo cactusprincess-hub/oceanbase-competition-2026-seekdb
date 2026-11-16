@@ -1,0 +1,35 @@
+# A failed row's retry delay must not block fresh work in the same table.
+connection default;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py start 19125
+create database ai_column_scheduling;
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('scheduling_model',
+  '{"type":"completion","model_name":"mock-complete"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('scheduling_ep',
+  '{"ai_model_name":"scheduling_model","url":"http://127.0.0.1:19125/v1/chat/completions","access_key":"scheduling-key","provider":"openai"}');
+create table ai_column_scheduling.docs(
+  id bigint primary key,
+  content varchar(200),
+  result varchar(400) AI COLUMN (
+    AI_COMPLETE('scheduling_model', content)
+  ) WITH (sync_mode='async', max_retries=100)
+);
+# The first row keeps failing until the second row has reached the service.
+# Checking request order after completion avoids sampling a short timing window.
+insert into ai_column_scheduling.docs(id, content)
+values(1, 'retry-until-fresh'), (2, 'fresh-work');
+let $retry = 20;
+let $done = 0;
+while ($retry)
+{
+  let $done = `select count(*) = 2 from ai_column_scheduling.docs where result is not null`;
+  if ($done == 1) { let $retry = 0; }
+  if ($done == 0) { --real_sleep 0.1
+    dec $retry; }
+}
+eval select $done = 1 as fresh_work_unblocks_retry;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py assert 19125 fresh-before-retry
+drop table ai_column_scheduling.docs;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('scheduling_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('scheduling_model');
+drop database ai_column_scheduling;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py stop 19125
