@@ -11,7 +11,7 @@ permissions:
 jobs:
   linux-build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 150
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - name: Prepare Linux build environment
@@ -40,11 +40,27 @@ jobs:
       - name: Compile release binary
         run: |
           set -o pipefail
-          cmake --build build_release --target seekdb -j2 2>&1 | tee linux-build.log
+          cmake --build build_release --target seekdb -j3 2>&1 | tee linux-build.log
           build_release/src/observer/seekdb --version
+      - name: Run AI column regression on Linux
+        run: |
+          set -o pipefail
+          python3 .github/script/seekdb/competition_ai_column_check.py fixed 2>&1 | tee linux-ai-column-fixed.log
+      - name: Save reusable Linux runtime
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-ai-column-runtime
+          retention-days: 2
+          path: |
+            build_release/src/observer/seekdb
+            deps/3rd/u01/obclient/
       - name: Save diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: linux-build-diagnostics
-          path: linux-*.log
+          path: |
+            linux-*.log
+            linux-ai-column-*/
+          retention-days: 5
