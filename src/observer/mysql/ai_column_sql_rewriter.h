@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "common/mysqlclient/ob_mysql_proxy.h"
+#include "lib/thread/threads.h"
 #include "lib/string/ob_sql_string.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "share/ob_server_struct.h"
@@ -1275,14 +1276,34 @@ private:
     }
   }
 
+  static void *worker_entry(void *)
+  {
+    worker_loop();
+    return nullptr;
+  }
+
   static void start_worker()
   {
+    using WorkerThread = lib::ObPThread;
     static std::mutex *start_mutex = new std::mutex();
     static bool *started = new bool(false);
+    static WorkerThread *worker_thread = nullptr;
     std::lock_guard<std::mutex> guard(*start_mutex);
     if (!*started) {
-      *started = true;
-      std::thread(&AiColumnSqlRewriter::worker_loop).detach();
+      int ret = OB_SUCCESS;
+      WorkerThread *thread = OB_NEW(WorkerThread, "AiColumnWorker",
+                                    &AiColumnSqlRewriter::worker_entry, nullptr);
+      if (OB_ISNULL(thread)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (OB_FAIL(thread->start())) {
+        OB_DELETE(WorkerThread, "AiColumnWorker", thread);
+      } else {
+        worker_thread = thread;
+        *started = true;
+      }
+      if (OB_FAIL(ret)) {
+        LOG_ERROR("failed to start AI column worker", KR(ret));
+      }
     }
   }
 
