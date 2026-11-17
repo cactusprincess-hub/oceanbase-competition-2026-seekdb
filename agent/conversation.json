@@ -1,0 +1,45 @@
+{
+  "schema": "competition-conversation-v1",
+  "synthetic": false,
+  "scope": "Authentic excerpts from the task conversation and local verification performed for the MiniVectorDB bonus task.",
+  "user_prompts": [
+    {
+      "source": "Codex task conversation",
+      "content": "高德20分了 继续"
+    },
+    {
+      "source": "Codex task conversation",
+      "content": "都没有，先做加赛"
+    }
+  ],
+  "conversations": [
+    {
+      "speaker": "assistant",
+      "content": "我会实现 MiniVectorDB 加赛，并先核对新增的 JSONL 协议与公开验收包。"
+    },
+    {
+      "speaker": "tool",
+      "content": "官方协议说明要求启动时先输出 {\"type\":\"ready\"}，请求和响应均为 JSONL；公开包包含 20 个用例。"
+    },
+    {
+      "speaker": "tool",
+      "content": "本地 protocol_check/run.py 磁盘存储版本：20 个公开用例全部通过；这不代表隐藏准入或正式得分。"
+    }
+  ],
+  "experiments": [
+    {
+      "id": "public-suite-disk-v3",
+      "command": ".venv/bin/python protocol_check/run.py --command '[\".venv/bin/python\",\"-m\",\"minivectordb.protocol\"]' --output protocol-results/disk-v3",
+      "exit_code": 0,
+      "output": "20/20 public cases passed",
+      "version": "codex/mini-vector-db working tree"
+    }
+  ],
+  "limitations": [
+    "No MiniMax, Qoder, or AMD environment is available in the current session.",
+    "The local container runtime is unavailable, so Docker build and Linux container validation have not been run.",
+    "The official hidden MySQL cases, performance ranking, and Agent review have not been run.",
+    "The current ANn request mode uses exact scan; a dedicated approximate vector index has not been implemented.",
+    "This file records only observable task inputs and tool results. It does not claim student-authored technical reflections or model-generated patch evidence."
+  ]
+}
