@@ -1,0 +1,48 @@
+# Document-local word aggregation must preserve frequencies, collations and
+# parser state across indexed inserts, updates and deletes.
+--disable_warnings
+drop database if exists fts_word_grouping;
+--enable_warnings
+create database fts_word_grouping;
+use fts_word_grouping;
+set names utf8mb4;
+
+select json_contains(tokenize('apple apple banana APPLE', 'beng', '[{"output":"all"}]'), '{"tokens":[{"apple":3},{"banana":1}],"doc_len":4}') as repeated_english;
+select json_contains(tokenize('数据库 数据库 苹果', 'ik', '[{"output":"all"}]'), '{"tokens":[{"数据库":2},{"苹果":1}],"doc_len":3}') as repeated_chinese;
+select json_length(json_extract(tokenize('CAFÉ café cafe', 'space', '[{"output":"all"}]'), '$.tokens')) as accent_insensitive_groups;
+select json_length(json_extract(tokenize(_utf8mb4'CAFÉ café cafe' collate utf8mb4_bin, 'space', '[{"output":"all"}]'), '$.tokens')) as binary_groups;
+select json_contains(tokenize('apple apple', 'space', '[{"output":"all"}]'), '{"tokens":[{"apple":2}],"doc_len":2}') as whitespace_frequency;
+select json_length(tokenize('', 'beng')) as empty_tokens;
+
+create table docs (
+  id int primary key,
+  body text,
+  fulltext index words(body) with parser beng
+);
+insert into docs values (1, 'apple apple banana'), (2, 'banana carrot'), (3, 'durian eggplant'), (4, 'fig grape');
+select id from docs where match(body) against('APPLE apple') order by id;
+select id from docs where match(body) against('banana') order by id;
+update docs set body='carrot carrot pear' where id=1;
+select id from docs where match(body) against('apple') order by id;
+select id from docs where match(body) against('carrot carrot') order by id;
+delete from docs where id=2;
+select id from docs where match(body) against('banana') order by id;
+insert into docs values (5, 'apple apple apple');
+select id from docs where match(body) against('apple') order by id;
+select json_contains(tokenize(cast(body as char), 'beng', '[{"output":"all"}]'), '{"tokens":[{"apple":3}],"doc_len":3}') as reinsert_frequency from docs where id=5;
+
+create table cn_docs (
+  id int primary key,
+  body text,
+  fulltext index words(body) with parser ik
+);
+insert into cn_docs values (1, '数据库 数据库 苹果'), (2, '香蕉 香蕉'), (3, '汽车 电影'), (4, '音乐 旅行');
+select id from cn_docs where match(body) against('数据库 数据库') order by id;
+select id from cn_docs where match(body) against('香蕉') order by id;
+update cn_docs set body='香蕉 香蕉 香蕉' where id=1;
+select id from cn_docs where match(body) against('数据库') order by id;
+select id from cn_docs where match(body) against('香蕉') order by id;
+delete from cn_docs where id=2;
+select id from cn_docs where match(body) against('香蕉') order by id;
+
+drop database fts_word_grouping;
