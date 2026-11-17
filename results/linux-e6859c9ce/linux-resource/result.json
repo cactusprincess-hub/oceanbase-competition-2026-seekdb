@@ -1,0 +1,7 @@
+{
+  "memory_limit_mib": 128,
+  "rows": 24000,
+  "varchar_bytes_per_row": 8192,
+  "passed": true,
+  "payload_mib": 187.5
+}

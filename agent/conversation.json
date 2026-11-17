@@ -28,18 +28,27 @@
   ],
   "experiments": [
     {
-      "id": "public-suite-disk-v3",
-      "command": ".venv/bin/python protocol_check/run.py --command '[\".venv/bin/python\",\"-m\",\"minivectordb.protocol\"]' --output protocol-results/disk-v3",
+      "id": "local-final-validation",
+      "code_version": "e6859c9ce1e1c812246ecb851db457671a66ea80",
+      "commands": [
+        ".venv/bin/python -m pytest -q tests",
+        ".venv/bin/python protocol_check/run.py --command '[\".venv/bin/python\",\"-m\",\"minivectordb.protocol\"]' --output protocol-results/post-push-check"
+      ],
       "exit_code": 0,
-      "output": "20/20 public cases passed",
-      "version": "codex/mini-vector-db working tree"
+      "output": "16 passed in 1.15s; all 20 public cases PASS."
+    },
+    {
+      "id": "linux-docker-validation",
+      "code_version": "e6859c9ce1e1c812246ecb851db457671a66ea80",
+      "url": "https://github.com/cactusprincess-hub/oceanbase-competition-2026-seekdb/actions/runs/44083737595",
+      "exit_code": 0,
+      "output": "Linux regression tests passed; Docker image built; official public protocol and SQL checks passed. Resource probe: {\"memory_limit_mib\":128,\"rows\":24000,\"varchar_bytes_per_row\":8192,\"passed\":true,\"payload_mib\":187.5}. Full ordering, normal restart, and uncommitted-delete kill recovery passed."
     }
   ],
   "limitations": [
     "No MiniMax, Qoder, or AMD environment is available in the current session.",
-    "The local container runtime is unavailable, so Docker build and Linux container validation have not been run.",
     "The official hidden MySQL cases, performance ranking, and Agent review have not been run.",
-    "The current ANn request mode uses exact scan; a dedicated approximate vector index has not been implemented.",
+    "The ANN mode uses a bounded exact flat-index fallback. A separate approximate candidate structure has not been implemented.",
     "This file records only observable task inputs and tool results. It does not claim student-authored technical reflections or model-generated patch evidence."
   ]
 }
